@@ -1,30 +1,30 @@
 import { useState } from 'react';
-import { GameState } from './engine/types';
-import { createGame, PlayerConfig } from './engine/reducer';
-import { LocalGame } from './ui/GameView';
-import { HostScreen, loadHostSave } from './net/HostScreen';
+import { GAMES } from './games';
+import type { GameEntry } from './net/protocol';
+import { LocalRoom, LocalSetup } from './net/rooms';
+import { HostScreen, clearHostSave, loadHostSave } from './net/HostScreen';
 import { GuestScreen } from './net/GuestScreen';
 
-const SAVE_KEY = 'catan-save-v1';
 const NAME_KEY = 'catan-name';
 
-function loadSave(): GameState | null {
+type Screen =
+  | { t: 'menu' }
+  | { t: 'localSetup'; game: string }
+  | { t: 'local'; game: string; state: unknown }
+  | { t: 'host'; game: string; resume: boolean }
+  | { t: 'join'; room: string };
+
+const joinParam = () => new URLSearchParams(location.search).get('join')?.trim().toLowerCase() || '';
+
+function loadLocal(entry: GameEntry): unknown | null {
   try {
-    const raw = localStorage.getItem(SAVE_KEY);
-    return raw ? (JSON.parse(raw) as GameState) : null;
+    const raw = localStorage.getItem(entry.saveKey);
+    const s = raw ? JSON.parse(raw) : null;
+    return s && entry.def.actor(s) !== null ? s : null;
   } catch {
     return null;
   }
 }
-
-type Screen =
-  | { t: 'menu' }
-  | { t: 'localSetup' }
-  | { t: 'local'; game: GameState }
-  | { t: 'host'; resume: boolean }
-  | { t: 'join'; room: string };
-
-const joinParam = () => new URLSearchParams(location.search).get('join')?.trim().toLowerCase() || '';
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>(() => {
@@ -46,16 +46,29 @@ export default function App() {
 
   switch (screen.t) {
     case 'local':
-      return <LocalGame initial={screen.game} saveKey={SAVE_KEY} onQuit={toMenu} />;
+      return <LocalRoom key={screen.game} entry={GAMES[screen.game]} initial={screen.state} onQuit={toMenu} />;
     case 'localSetup':
-      return <SetupScreen onStart={(game) => setScreen({ t: 'local', game })} onBack={toMenu} />;
+      return (
+        <LocalSetup
+          entry={GAMES[screen.game]}
+          onStart={(state) => setScreen({ t: 'local', game: screen.game, state })}
+          onBack={toMenu}
+        />
+      );
     case 'host':
-      return <HostScreen hostName={name.trim() || 'Host'} resume={screen.resume ? loadHostSave() : null} onQuit={toMenu} />;
+      return (
+        <HostScreen
+          entry={GAMES[screen.game]}
+          hostName={name.trim() || 'Host'}
+          resume={screen.resume ? loadHostSave() : null}
+          onQuit={toMenu}
+        />
+      );
     case 'join':
       if (joined && name.trim()) return <GuestScreen room={screen.room} name={name.trim()} onQuit={toMenu} />;
       return (
         <div className="setup">
-          <h1>Join Catan game</h1>
+          <h1>Join game</h1>
           <div className="panel">
             <div className="small muted">Room <b>{screen.room}</b></div>
             <form className="row" onSubmit={(e) => { e.preventDefault(); if (name.trim()) setJoined(true); }}>
@@ -73,90 +86,59 @@ export default function App() {
 }
 
 function Menu({ name, setName, go }: { name: string; setName: (n: string) => void; go: (s: Screen) => void }) {
+  const [gameId, setGameId] = useState(() => localStorage.getItem('last-game') ?? 'catan');
   const [code, setCode] = useState('');
-  const saved = loadSave();
+  const entry = GAMES[gameId] ?? GAMES.catan;
+  const pick = (id: string) => {
+    setGameId(id);
+    localStorage.setItem('last-game', id);
+  };
+  const saved = loadLocal(entry);
   const hosted = loadHostSave();
+  const hostedEntry = hosted && GAMES[hosted.gameId];
+  const canResume = !!(hosted?.game && hostedEntry && hostedEntry.def.actor(hosted.game) !== null);
   const room = code.trim().toLowerCase().replace(/.*[?&]join=/, '');
+
   return (
     <div className="setup">
-      <h1>Catan</h1>
+      <h1>Board games</h1>
+
       <div className="panel">
-        <h3>Play online with friends</h3>
         <input placeholder="Your name" maxLength={20} value={name} onChange={(e) => setName(e.target.value)} />
-        {hosted?.game && hosted.game.phase !== 'gameOver' && (
-          <button className="primary" onClick={() => go({ t: 'host', resume: true })}>
-            Resume hosted game (turn {hosted.game.turn}, room {hosted.room})
-          </button>
-        )}
-        <button className="primary" disabled={!name.trim()} onClick={() => go({ t: 'host', resume: false })}>
-          Host a new game
-        </button>
         <form className="row" onSubmit={(e) => { e.preventDefault(); if (room) go({ t: 'join', room }); }}>
-          <input placeholder="Room code or invite link" value={code} onChange={(e) => setCode(e.target.value)} />
+          <input placeholder="Join: room code or invite link" value={code} onChange={(e) => setCode(e.target.value)} />
           <button disabled={!room}>Join</button>
         </form>
-      </div>
-      <div className="panel">
-        <h3>Play on this device</h3>
-        {saved && saved.phase !== 'gameOver' && (
-          <button onClick={() => go({ t: 'local', game: saved })}>Continue saved game (turn {saved.turn})</button>
-        )}
-        <button onClick={() => go({ t: 'localSetup' })}>New local game</button>
-      </div>
-    </div>
-  );
-}
-
-function SetupScreen({ onStart, onBack }: { onStart: (g: GameState) => void; onBack: () => void }) {
-  const [players, setPlayers] = useState<PlayerConfig[]>([
-    { name: 'You', isAI: false },
-    { name: 'Computer 1', isAI: true },
-    { name: 'Computer 2', isAI: true },
-    { name: 'Computer 3', isAI: true },
-  ]);
-  const [count, setCount] = useState(4);
-  const [seed, setSeed] = useState('');
-
-  const update = (i: number, patch: Partial<PlayerConfig>) =>
-    setPlayers(players.map((p, j) => (j === i ? { ...p, ...patch } : p)));
-
-  const start = () => {
-    const s = seed.trim() ? Number(seed) || hashString(seed) : undefined;
-    onStart(createGame(players.slice(0, count), s));
-  };
-
-  return (
-    <div className="setup">
-      <h1>Local game</h1>
-      <div className="panel">
-        <div className="row">
-          Players:
-          {[3, 4].map((n) => (
-            <button key={n} className={count === n ? 'active' : ''} onClick={() => setCount(n)}>{n}</button>
-          ))}
-        </div>
-        {players.slice(0, count).map((p, i) => (
-          <div key={i} className="row">
-            <input value={p.name} onChange={(e) => update(i, { name: e.target.value })} />
-            <button className={!p.isAI ? 'active' : ''} onClick={() => update(i, { isAI: false })}>Human</button>
-            <button className={p.isAI ? 'active' : ''} onClick={() => update(i, { isAI: true })}>Computer</button>
+        {canResume && hosted && hostedEntry && (
+          <div className="row">
+            <button className="primary" onClick={() => go({ t: 'host', game: hosted.gameId, resume: true })}>
+              Resume hosted {hostedEntry.def.title} (room {hosted.room})
+            </button>
+            <button onClick={() => { clearHostSave(); go({ t: 'menu' }); setCode(''); }} title="Discard">✕</button>
           </div>
-        ))}
-        <div className="row">
-          <input placeholder="Board seed (optional)" value={seed} onChange={(e) => setSeed(e.target.value)} />
-        </div>
-        <button className="primary" onClick={start}>Start game</button>
+        )}
       </div>
-      <p className="small muted">
-        Multiple humans = hot-seat: hands are hidden between turns. Game auto-saves in this browser.
-      </p>
-      <button onClick={onBack}>Back</button>
+
+      <div className="games">
+        {Object.entries(GAMES).map(([id, g]) => (
+          <button key={id} className={`game-card ${id === gameId ? 'active' : ''}`} onClick={() => pick(id)}>
+            <b>{g.def.title}</b>
+            <span className="small">{g.def.blurb}</span>
+            <span className="small muted">{g.def.minPlayers}–{g.def.maxPlayers} players</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="panel">
+        <h3>{entry.def.title}</h3>
+        <button className="primary" disabled={!name.trim()} onClick={() => go({ t: 'host', game: gameId, resume: false })}>
+          Host online game{!name.trim() && ' (enter your name first)'}
+        </button>
+        {saved !== null && (
+          <button onClick={() => go({ t: 'local', game: gameId, state: saved })}>Continue local game</button>
+        )}
+        <button onClick={() => go({ t: 'localSetup', game: gameId })}>New local game</button>
+      </div>
     </div>
   );
-}
-
-function hashString(s: string) {
-  let h = 0;
-  for (const c of s) h = (Math.imul(h, 31) + c.charCodeAt(0)) | 0;
-  return Math.abs(h);
 }

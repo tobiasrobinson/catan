@@ -1,16 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import Peer, { DataConnection } from 'peerjs';
-import { Action, GameState } from '../engine/types';
-import { GameView } from '../ui/GameView';
-import { GuestMsg, HostMsg, LobbySeat, Offer, PEER_PREFIX, PING_MS, TIMEOUT_MS } from './protocol';
+import { GuestMsg, HostMsg, LobbySeat, PEER_PREFIX, PING_MS, TIMEOUT_MS } from './protocol';
+import { GAMES } from '../games';
 
 export function GuestScreen({ room, name, onQuit }: { room: string; name: string; onQuit: () => void }) {
   const [status, setStatus] = useState('Connecting…');
   const [rejected, setRejected] = useState('');
+  const [gameId, setGameId] = useState<string | null>(null);
   const [lobby, setLobby] = useState<LobbySeat[] | null>(null);
   const [seat, setSeat] = useState<number | null>(null);
-  const [game, setGame] = useState<GameState | null>(null);
-  const [offer, setOffer] = useState<Offer | null>(null);
+  const [game, setGame] = useState<unknown | null>(null);
+  const [extra, setExtra] = useState<unknown | null>(null);
   const [connected, setConnected] = useState<boolean[]>([]);
   const [error, setError] = useState('');
   const connRef = useRef<DataConnection | null>(null);
@@ -38,13 +38,15 @@ export function GuestScreen({ room, name, onQuit }: { room: string; name: string
         lastSeen = Date.now();
         switch (msg.t) {
           case 'lobby':
+            setGameId(msg.game);
             setLobby(msg.seats);
             setSeat(msg.seat);
             break;
           case 'state':
-            setGame(msg.game);
+            setGameId(msg.game);
+            setGame(msg.state);
             setSeat(msg.seat);
-            setOffer(msg.offer);
+            setExtra(msg.extra);
             setConnected(msg.connected);
             setError('');
             break;
@@ -106,24 +108,26 @@ export function GuestScreen({ room, name, onQuit }: { room: string; name: string
     return true;
   };
 
+  const entry = gameId ? GAMES[gameId] : null;
+  const over = !!(entry && game && entry.def.actor(game) === null);
   const leave = () => {
-    if (!game || game.phase === 'gameOver' || confirm('Leave the game? You can rejoin with the same name.')) onQuit();
+    if (!game || over || confirm('Leave the game? You can rejoin with the same name.')) onQuit();
   };
 
-  if (rejected) {
+  if (rejected || (gameId && !entry)) {
     return (
       <div className="setup">
         <h1>Couldn't join</h1>
-        <p>{rejected}</p>
+        <p>{rejected || 'The host is playing a game this version does not know. Try reloading the page.'}</p>
         <button onClick={onQuit}>Back</button>
       </div>
     );
   }
 
-  if (!game || seat === null) {
+  if (!entry || !game || seat === null) {
     return (
       <div className="setup">
-        <h1>Joining {room}</h1>
+        <h1>Joining {entry ? entry.def.title : 'game'} ({room})</h1>
         {status && <div className="muted">{status}</div>}
         {lobby && (
           <div className="panel">
@@ -143,18 +147,19 @@ export function GuestScreen({ room, name, onQuit }: { room: string; name: string
     );
   }
 
-  const offline = game.players.filter((p, i) => i > 0 && i !== seat && !p.isAI && connected[i] === false);
+  const players = (game as { players: { id: number; name: string; isAI: boolean }[] }).players;
+  const offline = players.filter((p, i) => i > 0 && i !== seat && !p.isAI && connected[i] === false);
+  const { View } = entry;
 
   return (
-    <GameView
+    <View
       game={game}
-      dispatch={(a: Action) => send({ t: 'action', action: a })}
-      error={error}
       seat={seat}
+      dispatch={(a) => send({ t: 'action', action: a })}
+      sendCustom={(c) => send({ t: 'custom', data: c })}
+      extra={extra}
+      error={error}
       onQuit={leave}
-      speed={0}
-      setSpeed={() => {}}
-      hideSpeed
       quitLabel="Leave"
       banner={
         <>
@@ -164,12 +169,6 @@ export function GuestScreen({ room, name, onQuit }: { room: string; name: string
           ))}
         </>
       }
-      trade={{
-        offer,
-        propose: (give, get) => send({ t: 'offer', give, get }),
-        cancel: () => send({ t: 'cancelOffer' }),
-        respond: (accept) => offer && send({ t: 'respond', id: offer.id, accept }),
-      }}
     />
   );
 }

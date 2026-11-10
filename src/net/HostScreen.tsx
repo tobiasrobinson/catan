@@ -1,30 +1,34 @@
 import { useEffect, useRef, useState } from 'react';
 import Peer, { DataConnection } from 'peerjs';
-import { Action, GameState, ResCount } from '../engine/types';
-import { applyAction, createGame } from '../engine/reducer';
-import { hasRes, totalCards } from '../engine/rules';
-import { aiAcceptTrade } from '../ai/heuristic';
-import { GameView, useAI, useSpeed } from '../ui/GameView';
-import {
-  GuestMsg, HostMsg, LobbySeat, Offer, PEER_PREFIX, PING_MS, TIMEOUT_MS, authorize, makeRoomCode, redact,
-} from './protocol';
+import { GameEntry, GuestMsg, HostMsg, LobbySeat, PEER_PREFIX, PING_MS, TIMEOUT_MS, makeRoomCode } from './protocol';
+import { useAI, useSpeed } from './rooms';
 
-export const HOST_SAVE_KEY = 'catan-host-v1';
+const SAVE_KEY = 'room-host-v2';
+const OLD_CATAN_KEY = 'catan-host-v1';
 
-interface HostSave {
+export interface HostSave {
+  gameId: string;
   room: string;
   count: number;
   seats: LobbySeat[];
-  game: GameState | null;
+  game: unknown | null;
 }
 
 export function loadHostSave(): HostSave | null {
   try {
-    const raw = localStorage.getItem(HOST_SAVE_KEY);
-    return raw ? (JSON.parse(raw) as HostSave) : null;
+    const raw = localStorage.getItem(SAVE_KEY);
+    if (raw) return JSON.parse(raw) as HostSave;
+    // Hosted games from before multi-game support were always Catan.
+    const old = localStorage.getItem(OLD_CATAN_KEY);
+    if (old) return { gameId: 'catan', ...(JSON.parse(old) as Omit<HostSave, 'gameId'>) };
   } catch {
-    return null;
+    /* corrupt save */
   }
+  return null;
+}
+export function clearHostSave() {
+  localStorage.removeItem(SAVE_KEY);
+  localStorage.removeItem(OLD_CATAN_KEY);
 }
 
 interface Guest {
@@ -35,75 +39,62 @@ interface Guest {
 
 const aiSeat = (i: number): LobbySeat => ({ name: `Computer ${i}`, human: false, connected: false });
 
-export function HostScreen({ hostName, resume, onQuit }: { hostName: string; resume: HostSave | null; onQuit: () => void }) {
+export function HostScreen({
+  entry, hostName, resume, onQuit,
+}: { entry: GameEntry; hostName: string; resume: HostSave | null; onQuit: () => void }) {
+  const { def, View } = entry;
   const [room] = useState(() => resume?.room ?? makeRoomCode());
-  const [count, setCount] = useState(resume?.count ?? 4);
-  const [seats, setSeats] = useState<LobbySeat[]>(
-    () => resume?.seats.map((s, i) => (i === 0 ? { ...s, connected: true } : { ...s, connected: false }))
-      ?? [{ name: hostName, human: true, connected: true }, aiSeat(1), aiSeat(2), aiSeat(3)],
-  );
-  const [game, setGame] = useState<GameState | null>(resume?.game ?? null);
-  const [offer, setOffer] = useState<Offer | null>(null);
+  const [count, setCount] = useState(resume?.count ?? Math.min(4, def.maxPlayers));
+  const [seats, setSeats] = useState<LobbySeat[]>(() => {
+    if (resume) return resume.seats.map((s, i) => ({ ...s, connected: i === 0 }));
+    return Array.from({ length: def.maxPlayers }, (_, i) => (i === 0 ? { name: hostName, human: true, connected: true } : aiSeat(i)));
+  });
+  const [game, setGame] = useState<unknown | null>(resume?.game ?? null);
+  const [extra, setExtra] = useState<unknown | null>(null);
   const [status, setStatus] = useState('Connecting to matchmaking server…');
   const [error, setError] = useState('');
   const [speed, setSpeed] = useSpeed();
 
   const guests = useRef(new Map<string, Guest>());
   // Latest values for use inside PeerJS callbacks.
-  const st = useRef({ game, offer, seats, count });
-  st.current = { game, offer, seats, count };
+  const st = useRef({ game, extra, seats, count });
+  st.current = { game, extra, seats, count };
 
   const send = (conn: DataConnection, msg: HostMsg) => {
     if (conn.open) conn.send(msg);
   };
 
-  // ---- message handling (shared by the host's own UI and remote guests) ----
+  // ---- state changes (shared by host UI, guests and AI) ----
+
+  /** Apply an action without permission checks. Returns an error or null. */
+  const step = (a: unknown): string | null => {
+    const { game, extra } = st.current;
+    if (!game) return 'The game has not started';
+    try {
+      const next = def.apply(game, a);
+      const x = def.extras ? def.extras.after(game, next, a, extra) : null;
+      st.current.game = next;
+      st.current.extra = x;
+      setGame(next);
+      setExtra(x);
+      return null;
+    } catch (e) {
+      return (e as Error).message;
+    }
+  };
 
   /** Returns an error message, or null on success. */
   const handle = (seat: number, msg: GuestMsg): string | null => {
-    const { game, offer } = st.current;
+    const { game, extra } = st.current;
     if (!game) return 'The game has not started';
-    switch (msg.t) {
-      case 'action': {
-        const err = authorize(game, seat, msg.action, offer);
-        if (err) return err;
-        try {
-          const next = applyAction(game, msg.action);
-          st.current.game = next;
-          setGame(next);
-          if (msg.action.type === 'playerTrade') setOffer(null);
-          return null;
-        } catch (e) {
-          return (e as Error).message;
-        }
-      }
-      case 'offer': {
-        if (game.current !== seat || game.phase !== 'main') return 'You can only offer trades on your turn';
-        if (!totalCards(msg.give) || !totalCards(msg.get)) return 'Both sides must give something';
-        if (!hasRes(game.players[seat].resources, msg.give)) return 'You lack those cards';
-        const responses: Offer['responses'] = {};
-        for (const o of game.players) {
-          if (o.id === seat) continue;
-          if (!hasRes(o.resources, msg.get)) responses[o.id] = 'decline';
-          else if (o.isAI) responses[o.id] = aiAcceptTrade(game, o.id, seat, msg.give, msg.get) ? 'accept' : 'decline';
-          else responses[o.id] = 'pending';
-        }
-        setOffer({ id: (offer?.id ?? 0) + 1, from: seat, give: msg.give, get: msg.get, responses });
-        return null;
-      }
-      case 'cancelOffer':
-        if (offer?.from === seat) setOffer(null);
-        return null;
-      case 'respond': {
-        if (!offer || offer.id !== msg.id || offer.responses[seat] !== 'pending') return null;
-        const ok = msg.accept && hasRes(game.players[seat].resources, offer.get);
-        setOffer({ ...offer, responses: { ...offer.responses, [seat]: ok ? 'accept' : 'decline' } });
-        return null;
-      }
-      case 'hello':
-      case 'ping':
-        return null;
+    if (msg.t === 'action') return def.authorize(game, seat, msg.action, extra) ?? step(msg.action);
+    if (msg.t === 'custom' && def.extras) {
+      const r = def.extras.onCustom(game, seat, msg.data, extra);
+      if ('error' in r) return r.error;
+      st.current.extra = r.x;
+      setExtra(r.x);
     }
+    return null;
   };
 
   const onHello = (id: string, name: string) => {
@@ -112,14 +103,13 @@ export function HostScreen({ hostName, resume, onQuit }: { hostName: string; res
     name = name.trim().slice(0, 20) || 'Guest';
     const { seats, game, count } = st.current;
     // Rejoin: same name as an existing human seat (e.g. after a page reload).
-    let seat = seats.findIndex((s, i) => i > 0 && s.human && s.name.toLowerCase() === name.toLowerCase());
+    let seat = seats.findIndex((s, i) => i > 0 && i < count && s.human && s.name.toLowerCase() === name.toLowerCase());
     if (seat < 0 && !game) seat = seats.findIndex((s, i) => i > 0 && i < count && !s.human);
     if (seat < 0) {
       send(g.conn, { t: 'rejected', reason: game ? 'This game has already started.' : 'The room is full.' });
       setTimeout(() => g.conn.close(), 500);
       return;
     }
-    // Kick any stale connection holding this seat.
     for (const [oid, o] of guests.current) {
       if (oid !== id && o.seat === seat) {
         o.seat = null;
@@ -129,9 +119,7 @@ export function HostScreen({ hostName, resume, onQuit }: { hostName: string; res
     g.seat = seat;
     setSeats((prev) => prev.map((s, i) => (i === seat ? { name: game ? s.name : name, human: true, connected: true } : s)));
     // If the AI was covering for them, hand control back.
-    if (game?.players[seat].isAI) {
-      setGame({ ...game, players: game.players.map((p) => (p.id === seat ? { ...p, isAI: false } : p)) });
-    }
+    if (game && def.isAI(game, seat)) setGame(def.setAI(game, seat, false));
   };
 
   const dropGuest = (id: string) => {
@@ -212,23 +200,21 @@ export function HostScreen({ hostName, resume, onQuit }: { hostName: string; res
     const connected = seats.map((s) => s.connected);
     for (const g of guests.current.values()) {
       if (g.seat === null) continue;
-      if (game) send(g.conn, { t: 'state', game: redact(game, g.seat), seat: g.seat, offer, connected });
-      else send(g.conn, { t: 'lobby', seats: seats.slice(0, count), seat: g.seat });
+      if (game) send(g.conn, { t: 'state', game: def.id, state: def.redact(game, g.seat), seat: g.seat, extra, connected });
+      else send(g.conn, { t: 'lobby', game: def.id, seats: seats.slice(0, count), seat: g.seat });
     }
-  }, [game, offer, seats, count]);
-
-  // Offers expire when the turn moves on.
-  useEffect(() => setOffer(null), [game?.turn, game?.phase === 'main']);
+  }, [game, extra, seats, count]);
 
   useEffect(() => {
-    localStorage.setItem(HOST_SAVE_KEY, JSON.stringify({ room, count, seats, game } satisfies HostSave));
+    localStorage.setItem(SAVE_KEY, JSON.stringify({ gameId: def.id, room, count, seats, game } satisfies HostSave));
+    localStorage.removeItem(OLD_CATAN_KEY);
   }, [room, count, seats, game]);
 
-  useAI(game ?? DUMMY, (g) => setGame(g), game ? speed : 1e9);
+  useAI(def, game, step, speed);
 
   const quit = () => {
-    if (!confirm('End this online game for everyone?')) return;
-    localStorage.removeItem(HOST_SAVE_KEY);
+    if (game && def.actor(game) !== null && !confirm('End this online game for everyone?')) return;
+    clearHostSave();
     onQuit();
   };
 
@@ -239,13 +225,11 @@ export function HostScreen({ hostName, resume, onQuit }: { hostName: string; res
       for (const g of guests.current.values()) if (g.seat === i) g.conn.close();
       setSeats((prev) => prev.map((s, j) => (j === i ? aiSeat(i) : s)));
     };
-    const begin = () => {
-      const used = seats.slice(0, count);
-      setGame(createGame(used.map((s) => ({ name: s.name, isAI: !s.human }))));
-    };
+    const begin = () => setGame(def.create(seats.slice(0, count).map((s) => ({ name: s.name, isAI: !s.human }))));
+    const counts = Array.from({ length: def.maxPlayers - def.minPlayers + 1 }, (_, i) => def.minPlayers + i);
     return (
       <div className="setup">
-        <h1>Host a game</h1>
+        <h1>Host {def.title}</h1>
         {status && <div className="muted">{status}</div>}
         <div className="panel">
           <div>Send this link to your friends:</div>
@@ -258,11 +242,11 @@ export function HostScreen({ hostName, resume, onQuit }: { hostName: string; res
         <div className="panel">
           <div className="row">
             Players:
-            {[3, 4].map((n) => (
+            {counts.map((n) => (
               <button
                 key={n}
                 className={count === n ? 'active' : ''}
-                disabled={n < count && seats[n].human}
+                disabled={seats.slice(n).some((s) => s.human)}
                 onClick={() => setCount(n)}
               >
                 {n}
@@ -286,9 +270,8 @@ export function HostScreen({ hostName, resume, onQuit }: { hostName: string; res
     );
   }
 
-  const dropped = seats
-    .map((s, i) => ({ ...s, i }))
-    .filter((s) => s.i > 0 && s.i < game.players.length && s.human && !s.connected);
+  const nPlayers = (game as { players: unknown[] }).players.length;
+  const dropped = seats.map((s, i) => ({ ...s, i })).filter((s) => s.i > 0 && s.i < nPlayers && s.human && !s.connected);
 
   const banner = (
     <>
@@ -296,16 +279,10 @@ export function HostScreen({ hostName, resume, onQuit }: { hostName: string; res
       {dropped.map((s) => (
         <div key={s.i} className="banner">
           {s.name} disconnected.{' '}
-          {game.players[s.i].isAI ? (
+          {def.isAI(game, s.i) ? (
             <i>AI is playing for them until they rejoin.</i>
           ) : (
-            <button
-              onClick={() =>
-                setGame({ ...game, players: game.players.map((p) => (p.id === s.i ? { ...p, isAI: true } : p)) })
-              }
-            >
-              Let AI play for {s.name}
-            </button>
+            <button onClick={() => setGame(def.setAI(game, s.i, true))}>Let AI play for {s.name}</button>
           )}
         </div>
       ))}
@@ -320,25 +297,18 @@ export function HostScreen({ hostName, resume, onQuit }: { hostName: string; res
   };
 
   return (
-    <GameView
+    <View
       game={game}
-      dispatch={(a: Action) => local({ t: 'action', action: a })}
-      error={error}
       seat={0}
+      dispatch={(a) => local({ t: 'action', action: a })}
+      sendCustom={(c) => local({ t: 'custom', data: c })}
+      extra={extra}
+      error={error}
       onQuit={quit}
+      quitLabel="End game"
       speed={speed}
       setSpeed={setSpeed}
       banner={banner}
-      quitLabel="End game"
-      trade={{
-        offer,
-        propose: (give: ResCount, get: ResCount) => local({ t: 'offer', give, get }),
-        cancel: () => local({ t: 'cancelOffer' }),
-        respond: (accept) => offer && local({ t: 'respond', id: offer.id, accept }),
-      }}
     />
   );
 }
-
-// useAI needs a game object even before one exists; with a huge delay it never fires.
-const DUMMY = createGame([{ name: '', isAI: false }, { name: '', isAI: false }, { name: '', isAI: false }], 1);

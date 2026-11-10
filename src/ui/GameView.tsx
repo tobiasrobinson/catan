@@ -1,11 +1,10 @@
-import { ReactNode, useEffect, useRef, useState } from 'react';
+import { ReactNode, useEffect, useState } from 'react';
 import { Action, GameState, ResCount } from '../engine/types';
-import { applyAction } from '../engine/reducer';
 import {
   actingPlayer, emptyRes, legalCities, legalRoads, legalSettlements, legalSetupRoads, robberVictims, totalCards,
 } from '../engine/rules';
-import { aiAct } from '../ai/heuristic';
-import { Offer } from '../net/protocol';
+import { CatanCustom, Offer } from '../engine/online';
+import type { ViewProps } from '../net/protocol';
 import { Board } from './Board';
 import { BuildMode, Sidebar } from './Sidebar';
 import { Modal, ResChip, ResEditor } from './Widgets';
@@ -26,40 +25,12 @@ export interface GameViewProps {
   /** 'hotseat' = several humans share this screen; number = this screen controls that seat; null = spectator */
   seat: 'hotseat' | number | null;
   onQuit: () => void;
-  speed: number;
-  setSpeed: (n: number) => void;
+  speed?: number;
+  setSpeed?: (n: number) => void;
   trade?: OnlineTrade;
   banner?: ReactNode;
   hideSpeed?: boolean;
   quitLabel?: string;
-}
-
-export function useSpeed() {
-  const [speed, setSpeed] = useState(() => Number(localStorage.getItem('catan-speed')) || 600);
-  useEffect(() => localStorage.setItem('catan-speed', String(speed)), [speed]);
-  return [speed, setSpeed] as const;
-}
-
-/** Runs AI turns. Only the screen that owns the authoritative game state should call this. */
-export function useAI(game: GameState, setGame: (g: GameState) => void, speed: number) {
-  const actorPl = game.players[actingPlayer(game)];
-  useEffect(() => {
-    if (game.phase === 'gameOver' || !actorPl.isAI) return;
-    const delay = game.phase.startsWith('setup') ? Math.min(speed, 500) : speed;
-    const id = setTimeout(() => {
-      try {
-        setGame(applyAction(game, aiAct(game)));
-      } catch (e) {
-        console.error('AI error', e);
-        try {
-          setGame(applyAction(game, { type: 'endTurn' }));
-        } catch {
-          /* stuck; leave for debugging */
-        }
-      }
-    }, delay);
-    return () => clearTimeout(id);
-  }, [game, speed, actorPl.isAI]);
 }
 
 export function GameView({ game, dispatch, error, seat, onQuit, speed, setSpeed, trade, banner, hideSpeed, quitLabel }: GameViewProps) {
@@ -206,41 +177,29 @@ function DiscardDialog({ game, p, dispatch }: { game: GameState; p: number; disp
   );
 }
 
-/** Local (single-screen) game: owns state, runs AI, auto-saves. */
-export function LocalGame({ initial, onQuit, saveKey }: { initial: GameState; onQuit: () => void; saveKey: string }) {
-  const [game, setGame] = useState(initial);
-  const [error, setError] = useState('');
-  const [speed, setSpeed] = useSpeed();
-  const ref = useRef(game);
-  ref.current = game;
-  useAI(game, setGame, speed);
-  useEffect(() => localStorage.setItem(saveKey, JSON.stringify(game)), [game]);
-
-  const humans = game.players.filter((p) => !p.isAI);
-  const dispatch = (a: Action) => {
-    try {
-      setGame(applyAction(ref.current, a));
-      setError('');
-      return true;
-    } catch (e) {
-      setError((e as Error).message);
-      return false;
-    }
-  };
+/** Adapter from the generic room interface to Catan's view. */
+export function CatanView(p: ViewProps<GameState, Action, Offer, CatanCustom>) {
+  const send = p.sendCustom;
   return (
     <GameView
-      game={game}
-      dispatch={dispatch}
-      error={error}
-      seat={humans.length > 1 ? 'hotseat' : humans[0]?.id ?? null}
-      onQuit={() => {
-        if (game.phase === 'gameOver' || confirm('Abandon this game?')) {
-          localStorage.removeItem(saveKey);
-          onQuit();
+      game={p.game}
+      dispatch={p.dispatch}
+      error={p.error}
+      seat={p.seat}
+      onQuit={p.onQuit}
+      quitLabel={p.quitLabel}
+      banner={p.banner}
+      speed={p.speed}
+      setSpeed={p.setSpeed}
+      hideSpeed={!p.setSpeed}
+      trade={
+        send && {
+          offer: p.extra,
+          propose: (give, get) => send({ t: 'offer', give, get }),
+          cancel: () => send({ t: 'cancelOffer' }),
+          respond: (accept) => p.extra && send({ t: 'respond', id: p.extra.id, accept }),
         }
-      }}
-      speed={speed}
-      setSpeed={setSpeed}
+      }
     />
   );
 }

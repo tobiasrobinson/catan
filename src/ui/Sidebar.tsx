@@ -8,7 +8,7 @@ import { aiAcceptTrade } from '../ai/heuristic';
 import { CostChips, ResChip, ResEditor, ResSelect } from './Widgets';
 import { DEV_DESC, DEV_LABEL, RES_LABEL } from './theme';
 import type { OnlineTrade } from './GameView';
-import type { Resp } from '../net/protocol';
+import type { Resp } from '../engine/online';
 
 export type BuildMode = 'road' | 'settlement' | 'city' | null;
 
@@ -21,8 +21,8 @@ interface Props {
   dispatch: (a: Action) => boolean;
   error: string;
   onQuit: () => void;
-  speed: number;
-  setSpeed: (n: number) => void;
+  speed?: number;
+  setSpeed?: (n: number) => void;
   trade?: OnlineTrade;
   hideSpeed?: boolean;
   quitLabel?: string;
@@ -78,7 +78,7 @@ export function Sidebar(props: Props) {
         <div className="row">
           {!hideSpeed && <label className="small">
             AI speed{' '}
-            <select value={speed} onChange={(e) => setSpeed(Number(e.target.value))}>
+            <select value={speed} onChange={(e) => setSpeed?.(Number(e.target.value))}>
               <option value={1200}>Slow</option>
               <option value={600}>Normal</option>
               <option value={250}>Fast</option>

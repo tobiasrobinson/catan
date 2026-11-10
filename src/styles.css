@@ -105,3 +105,26 @@ details summary { cursor: pointer; margin: 8px 0; }
 .banner { background: #3a2f1e; color: #ffd27a; border-radius: 6px; padding: 6px 10px; margin-bottom: 6px; }
 .banner.small { background: transparent; padding: 0 10px; word-break: break-all; }
 .menu-choice { display: flex; flex-direction: column; gap: 8px; }
+
+/* Banners stack above the board */
+.board-wrap { flex-direction: column; }
+.board-wrap > .board { flex: 1; min-height: 0; }
+
+/* Carcassonne */
+.carc-wrap { background: #24402a; }
+.carc-spot { cursor: pointer; }
+.carc-spot:hover { fill: rgba(255, 224, 138, .3); }
+.carc-ghost { cursor: pointer; opacity: .85; }
+.carc-option { cursor: pointer; }
+.carc-option:hover circle { fill-opacity: .95; }
+.carc-current { display: flex; gap: 12px; align-items: center; }
+.carc-controls { display: flex; flex-direction: column; gap: 6px; }
+.carc-controls button { font-size: 18px; }
+.carc-controls button.primary { font-size: 14px; }
+.carc-meeples { display: inline-flex; align-items: center; gap: 2px; }
+.carc-rules { margin: 6px 0 0; padding-left: 18px; }
+
+/* Game picker */
+.games { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.game-card { flex-direction: column; align-items: flex-start; text-align: left; padding: 12px; }
+.game-card b { font-size: 16px; }

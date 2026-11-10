@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { createGame } from '../src/engine/reducer';
 import { emptyRes } from '../src/engine/rules';
-import { authorize, Offer, redact } from '../src/net/protocol';
+import { authorize, Offer, redact } from '../src/engine/online';
 
 const humans = () => createGame([0, 1, 2].map((i) => ({ name: `P${i}`, isAI: false })), 7);
 
